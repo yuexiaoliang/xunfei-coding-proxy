@@ -21,11 +21,9 @@ const CONFIG = {
   upstreamBase: process.env.UPSTREAM_BASE || 'https://maas-coding-api.cn-huabei-1.xf-yun.com',
 
   // 重试配置
-  maxRetries: parseInt(process.env.MAX_RETRIES || '10', 10),
+  maxRetries: parseInt(process.env.MAX_RETRIES || '60', 10),
+  // 重试间隔（固定，每秒一次）
   retryDelayMs: parseInt(process.env.RETRY_DELAY_MS || '1000', 10),
-  retryDelayMaxMs: parseInt(process.env.RETRY_DELAY_MAX_MS || '30000', 10),
-  // 退避倍数
-  backoffMultiplier: parseFloat(process.env.BACKOFF_MULTIPLIER || '2'),
 
   // 需要重试的 HTTP 状态码
   retryStatusCodes: new Set([
@@ -66,13 +64,9 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function calculateDelay(attempt) {
-  const delay = Math.min(
-    CONFIG.retryDelayMs * Math.pow(CONFIG.backoffMultiplier, attempt),
-    CONFIG.retryDelayMaxMs
-  );
-  // 添加 0~20% 的随机抖动
-  return Math.floor(delay * (1 + Math.random() * 0.2));
+function calculateDelay() {
+  // 固定间隔，每秒一次（加少量抖动避免惊群）
+  return CONFIG.retryDelayMs + Math.floor(Math.random() * 200);
 }
 
 /**
@@ -188,7 +182,7 @@ async function handleNonStreamRequest(clientReq, clientRes, targetUrl, headers, 
 
   for (let attempt = 0; attempt <= CONFIG.maxRetries; attempt++) {
     if (attempt > 0) {
-      const delay = calculateDelay(attempt - 1);
+      const delay = calculateDelay();
       log('info', `非流式请求第 ${attempt} 次重试，等待 ${delay}ms...`, { url: targetUrl });
       await sleep(delay);
     }
@@ -281,7 +275,7 @@ async function handleStreamRequest(clientReq, clientRes, targetUrl, headers, bod
 
   for (let attempt = 0; attempt <= CONFIG.maxRetries; attempt++) {
     if (attempt > 0) {
-      const delay = calculateDelay(attempt - 1);
+      const delay = calculateDelay();
       log('info', `流式请求第 ${attempt} 次重试，等待 ${delay}ms...`, { url: targetUrl });
       await sleep(delay);
     }
