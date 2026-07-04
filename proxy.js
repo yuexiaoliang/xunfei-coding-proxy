@@ -12,6 +12,26 @@ const http = require('http');
 const https = require('https');
 const { URL } = require('url');
 
+// ============ 连接池（TLS 复用）============
+// 复用 HTTPS 连接，避免每次重试都重新 TLS 握手
+const httpsAgent = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 30000,
+  maxSockets: 64,        // 每个主机最大连接数
+  maxFreeSockets: 16,    // 空闲连接数
+  timeout: 60000,
+});
+const httpAgent = new http.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 30000,
+  maxSockets: 64,
+  maxFreeSockets: 16,
+});
+
+function getAgent(protocol) {
+  return protocol === 'https:' ? httpsAgent : httpAgent;
+}
+
 // ============ 配置 ============
 const CONFIG = {
   // 代理监听端口
@@ -97,6 +117,7 @@ function forwardRequest(targetUrl, method, headers, body, timeoutMs) {
       method: method,
       headers: headers,
       timeout: timeoutMs,
+      agent: getAgent(parsedUrl.protocol),
     };
 
     const req = lib.request(options, (res) => {
@@ -183,7 +204,7 @@ async function handleNonStreamRequest(clientReq, clientRes, targetUrl, headers, 
   for (let attempt = 0; attempt <= CONFIG.maxRetries; attempt++) {
     if (attempt > 0) {
       const delay = calculateDelay();
-      log('info', `非流式请求第 ${attempt} 次重试，等待 ${delay}ms...`, { url: targetUrl });
+      log('debug', `非流式请求第 ${attempt} 次重试，等待 ${delay}ms...`, { url: targetUrl });
       await sleep(delay);
     }
 
@@ -203,11 +224,10 @@ async function handleNonStreamRequest(clientReq, clientRes, targetUrl, headers, 
         continue;
       }
 
-      // 成功，转发响应
       clientRes.writeHead(upstreamRes.statusCode, upstreamRes.headers);
       clientRes.end(responseBody);
-      log('info', `非流式请求成功 (状态码: ${upstreamRes.statusCode})`, {
-        attempt, url: targetUrl, contentLength: responseBody.length
+      log(attempt > 0 ? 'info' : 'debug', `非流式请求成功 (重试 ${attempt} 次, 状态码: ${upstreamRes.statusCode})`, {
+        url: targetUrl, contentLength: responseBody.length
       });
       return;
 
@@ -276,7 +296,7 @@ async function handleStreamRequest(clientReq, clientRes, targetUrl, headers, bod
   for (let attempt = 0; attempt <= CONFIG.maxRetries; attempt++) {
     if (attempt > 0) {
       const delay = calculateDelay();
-      log('info', `流式请求第 ${attempt} 次重试，等待 ${delay}ms...`, { url: targetUrl });
+      log('debug', `流式请求第 ${attempt} 次重试，等待 ${delay}ms...`, { url: targetUrl });
       await sleep(delay);
     }
 
@@ -395,15 +415,14 @@ async function handleStreamRequest(clientReq, clientRes, targetUrl, headers, bod
             // 计算实际内容长度
             const totalLength = bufferChunks.reduce((sum, c) => sum + c.length, 0);
             respHeaders['content-length'] = totalLength;
-            delete respHeaders['transfer-encoding'];
             clientRes.writeHead(upstreamRes.statusCode, respHeaders);
             for (const bc of bufferChunks) {
               clientRes.write(bc);
             }
           }
           clientRes.end();
-          log('info', `流式请求成功`, {
-            attempt, url: targetUrl, statusCode: upstreamRes.statusCode
+          log(attempt > 0 ? 'info' : 'debug', `流式请求成功 (重试 ${attempt} 次)`, {
+            url: targetUrl, statusCode: upstreamRes.statusCode
           });
           resolve();
         };
@@ -511,6 +530,7 @@ async function handleRequest(clientReq, clientRes) {
 
 /**
  * 判断请求是否为流式请求
+ * 注意：避免解析整个大请求体，只在前面部分查找 stream 字段
  */
 function isStreamRequest(req, body) {
   // 检查 URL 参数
@@ -525,14 +545,23 @@ function isStreamRequest(req, body) {
   }
 
   // 检查请求体中的 stream 字段
+  // 只看前 4KB，stream 字段通常在请求体开头
   if (body && body.length > 0) {
-    try {
-      const json = JSON.parse(body.toString());
-      if (json.stream === true) {
-        return true;
+    const preview = body.subarray(0, 4096).toString();
+    // 快速字符串匹配，避免完整 JSON.parse
+    if (preview.includes('"stream"')) {
+      try {
+        const json = JSON.parse(preview);
+        if (json.stream === true) {
+          return true;
+        }
+      } catch {
+        // 4KB 可能不是完整 JSON，但 stream 字段在开头已能解析
+        // 退一步：直接看 "stream": true 字符串
+        if (/"stream"\s*:\s*true/.test(preview)) {
+          return true;
+        }
       }
-    } catch {
-      // 非 JSON 请求体
     }
   }
 
