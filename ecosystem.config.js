@@ -16,8 +16,8 @@ module.exports = {
         UPSTREAM_BASE: 'https://maas-coding-api.cn-huabei-1.xf-yun.com',
         // 最大重试次数
         MAX_RETRIES: 60,
-        // 重试间隔（固定，每秒一次）
-        RETRY_DELAY_MS: 1000,
+        // 重试间隔（固定，每3秒一次）
+        RETRY_DELAY_MS: 3000,
         // 请求超时（毫秒，5分钟）
         REQUEST_TIMEOUT_MS: 300000,
         // 日志级别: debug | info | warn | error

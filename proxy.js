@@ -42,8 +42,8 @@ const CONFIG = {
 
   // 重试配置
   maxRetries: parseInt(process.env.MAX_RETRIES || '60', 10),
-  // 重试间隔（固定，每秒一次）
-  retryDelayMs: parseInt(process.env.RETRY_DELAY_MS || '1000', 10),
+  // 重试间隔（固定，每3秒一次）
+  retryDelayMs: parseInt(process.env.RETRY_DELAY_MS || '3000', 10),
 
   // 需要重试的 HTTP 状态码
   retryStatusCodes: new Set([
@@ -85,7 +85,7 @@ function sleep(ms) {
 }
 
 function calculateDelay() {
-  // 固定间隔，每秒一次（加少量抖动避免惊群）
+  // 固定间隔（加少量抖动避免惊群）
   return CONFIG.retryDelayMs + Math.floor(Math.random() * 200);
 }
 
