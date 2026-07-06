@@ -226,7 +226,7 @@ async function handleNonStreamRequest(clientReq, clientRes, targetUrl, headers, 
 
       clientRes.writeHead(upstreamRes.statusCode, upstreamRes.headers);
       clientRes.end(responseBody);
-      log(attempt > 0 ? 'info' : 'debug', `非流式请求成功 (重试 ${attempt} 次, 状态码: ${upstreamRes.statusCode})`, {
+      log('info', `非流式请求成功 (重试 ${attempt} 次, 状态码: ${upstreamRes.statusCode})`, {
         url: targetUrl, contentLength: responseBody.length
       });
       return;
@@ -421,7 +421,7 @@ async function handleStreamRequest(clientReq, clientRes, targetUrl, headers, bod
             }
           }
           clientRes.end();
-          log(attempt > 0 ? 'info' : 'debug', `流式请求成功 (重试 ${attempt} 次)`, {
+          log('info', `流式请求成功 (重试 ${attempt} 次)`, {
             url: targetUrl, statusCode: upstreamRes.statusCode
           });
           resolve();

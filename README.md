@@ -37,6 +37,52 @@ API Key 保持不变，代理会原样转发。
 curl http://localhost:9090/health
 ```
 
+
+## 监控仪表盘
+
+项目自带一个 Web 监控界面，可实时查看日志、成功率、重试统计、响应时长等。
+
+### 启动
+
+```bash
+# 方式一：直接运行
+npm run monitor
+
+# 方式二：随 PM2 一起启动（推荐）
+npm run pm2:start   # ecosystem.config.js 已包含 monitor
+```
+
+启动后访问：http://localhost:9091
+
+### 功能
+
+- **KPI 卡片**：成功率、请求总数、成功/失败数、重试次数、平均/P50/P95/Max 耗时
+- **按路径分布**：每个 API 路径的请求数、成功数、失败数、成功率
+- **重试次数直方图**：0 次 / 1-3 / 4-10 / 11-30 / 31+ 区间分布
+- **上游状态码统计**：按 HTTP 状态码汇总
+- **失败样本**：最近 20 条失败请求
+- **实时日志流**：SSE 推送，支持按级别（INFO/WARN/ERROR）过滤和关键字搜索
+- **时间窗口**：全部 / 5 分钟 / 15 分钟 / 1 小时 / 6 小时 / 24 小时
+
+### API 端点
+
+| 端点 | 说明 |
+|------|------|
+| `GET /` | 仪表盘 HTML 页面 |
+| `GET /api/stats?minutes=15` | 统计指标 JSON（minutes=0 表示全部） |
+| `GET /api/logs?lines=300&level=WARN&q=503` | 历史日志 JSON |
+| `GET /api/stream` | 实时日志 SSE 流 |
+| `GET /health` | 健康检查 |
+
+### 环境变量
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `MONITOR_PORT` | `9091` | 监控服务端口 |
+| `MONITOR_LOG` | `./logs/out.log` | 代理日志文件路径 |
+| `MONITOR_TAIL_BYTES` | `2097152` | 解析日志的尾部最大字节数 |
+| `MONITOR_POLL_MS` | `1500` | SSE 轮询间隔（毫秒） |
+
 ## 环境变量配置
 
 | 变量 | 默认值 | 说明 |

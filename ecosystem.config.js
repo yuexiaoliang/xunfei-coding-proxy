@@ -1,6 +1,25 @@
 module.exports = {
   apps: [
     {
+      name: 'xunfei-monitor',
+      script: 'monitor.js',
+      exec_mode: 'fork',
+      instances: 1,
+      autorestart: true,
+      watch: false,
+      max_memory_restart: '256M',
+      env: {
+        NODE_ENV: 'production',
+        MONITOR_PORT: 9091,
+        MONITOR_LOG: './logs/out.log',
+      },
+      error_file: './logs/monitor-error.log',
+      out_file: './logs/monitor-out.log',
+      log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
+      merge_logs: true,
+      kill_timeout: 5000,
+    },
+    {
       name: 'xunfei-coding-proxy',
       script: 'proxy.js',
       exec_mode: 'fork',

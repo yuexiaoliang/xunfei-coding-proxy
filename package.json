@@ -9,8 +9,15 @@
     "pm2:stop": "pm2 stop xunfei-coding-proxy",
     "pm2:restart": "pm2 restart xunfei-coding-proxy",
     "pm2:logs": "pm2 logs xunfei-coding-proxy",
-    "pm2:status": "pm2 status xunfei-coding-proxy"
+    "pm2:status": "pm2 status xunfei-coding-proxy",
+    "monitor": "node monitor.js",
+    "monitor:pm2": "pm2 start monitor.js --name xunfei-monitor"
   },
-  "keywords": ["proxy", "xunfei", "coding-plan", "retry"],
+  "keywords": [
+    "proxy",
+    "xunfei",
+    "coding-plan",
+    "retry"
+  ],
   "license": "MIT"
 }
