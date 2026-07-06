@@ -198,7 +198,7 @@ function shouldRetryNonStreamResponse(res, body) {
 /**
  * 处理非流式请求（带重试）
  */
-async function handleNonStreamRequest(clientReq, clientRes, targetUrl, headers, body) {
+async function handleNonStreamRequest(clientReq, clientRes, targetUrl, headers, body, model = '') {
   let lastError = null;
 
   for (let attempt = 0; attempt <= CONFIG.maxRetries; attempt++) {
@@ -218,7 +218,7 @@ async function handleNonStreamRequest(clientReq, clientRes, targetUrl, headers, 
       if (shouldRetryNonStreamResponse(upstreamRes, responseBody)) {
         const bodyPreview = responseBody.toString().substring(0, 200);
         log('warn', `非流式请求遇到可重试错误 (状态码: ${upstreamRes.statusCode})`, {
-          attempt, bodyPreview
+          attempt, model, bodyPreview
         });
         lastError = new Error(`Retryable status: ${upstreamRes.statusCode}`);
         continue;
@@ -227,7 +227,7 @@ async function handleNonStreamRequest(clientReq, clientRes, targetUrl, headers, 
       clientRes.writeHead(upstreamRes.statusCode, upstreamRes.headers);
       clientRes.end(responseBody);
       log('info', `非流式请求成功 (重试 ${attempt} 次, 状态码: ${upstreamRes.statusCode})`, {
-        url: targetUrl, contentLength: responseBody.length
+        url: targetUrl, model, statusCode: upstreamRes.statusCode, contentLength: responseBody.length
       });
       return;
 
@@ -238,7 +238,7 @@ async function handleNonStreamRequest(clientReq, clientRes, targetUrl, headers, 
   }
 
   // 所有重试都失败了
-  log('error', `非流式请求所有重试失败`, { url: targetUrl, maxRetries: CONFIG.maxRetries });
+  log('error', `非流式请求所有重试失败`, { url: targetUrl, model, maxRetries: CONFIG.maxRetries });
   clientRes.writeHead(502, { 'Content-Type': 'application/json' });
   clientRes.end(JSON.stringify({
     error: {
@@ -290,7 +290,7 @@ function checkSSEEventForRetryableError(data) {
  * 策略：先缓冲前 N 个 SSE 事件检查错误码，确认无错后直通转发。
  * 如果前 N 个事件包含可重试错误，则中断并重试。
  */
-async function handleStreamRequest(clientReq, clientRes, targetUrl, headers, body) {
+async function handleStreamRequest(clientReq, clientRes, targetUrl, headers, body, model = '') {
   let lastError = null;
 
   for (let attempt = 0; attempt <= CONFIG.maxRetries; attempt++) {
@@ -309,7 +309,7 @@ async function handleStreamRequest(clientReq, clientRes, targetUrl, headers, bod
       if (CONFIG.retryStatusCodes.has(upstreamRes.statusCode)) {
         const errBody = await collectResponse(upstreamRes);
         log('warn', `流式请求收到可重试状态码: ${upstreamRes.statusCode}`, {
-          attempt, body: errBody.toString().substring(0, 300)
+          attempt, model, body: errBody.toString().substring(0, 300)
         });
         lastError = new Error(`Retryable status: ${upstreamRes.statusCode}`);
         continue;
@@ -320,7 +320,7 @@ async function handleStreamRequest(clientReq, clientRes, targetUrl, headers, bod
         const responseBody = await collectResponse(upstreamRes);
         if (shouldRetryNonStreamResponse(upstreamRes, responseBody)) {
           log('warn', `流式请求收到非 SSE 可重试响应 (状态码: ${upstreamRes.statusCode})`, {
-            attempt, body: responseBody.toString().substring(0, 300)
+            attempt, model, body: responseBody.toString().substring(0, 300)
           });
           lastError = new Error(`Retryable non-SSE response: ${upstreamRes.statusCode}`);
           continue;
@@ -362,7 +362,7 @@ async function handleStreamRequest(clientReq, clientRes, targetUrl, headers, bod
 
                 if (checkSSEEventForRetryableError(data)) {
                   log('warn', `流式模式: 缓冲阶段检测到可重试错误`, {
-                    attempt, eventData: data.substring(0, 200)
+                    attempt, model, eventData: data.substring(0, 200)
                   });
                   errorDetected = true;
                   lastError = new Error(`Retryable SSE error`);
@@ -422,7 +422,7 @@ async function handleStreamRequest(clientReq, clientRes, targetUrl, headers, bod
           }
           clientRes.end();
           log('info', `流式请求成功 (重试 ${attempt} 次)`, {
-            url: targetUrl, statusCode: upstreamRes.statusCode
+            url: targetUrl, model, statusCode: upstreamRes.statusCode
           });
           resolve();
         };
@@ -454,7 +454,7 @@ async function handleStreamRequest(clientReq, clientRes, targetUrl, headers, bod
   }
 
   // 所有重试都失败了
-  log('error', `流式请求所有重试失败`, { url: targetUrl, maxRetries: CONFIG.maxRetries });
+  log('error', `流式请求所有重试失败`, { url: targetUrl, model, maxRetries: CONFIG.maxRetries });
 
   if (!clientRes.headersSent) {
     clientRes.writeHead(502, { 'Content-Type': 'application/json' });
@@ -489,28 +489,33 @@ async function handleRequest(clientReq, clientRes) {
   headers['host'] = new URL(CONFIG.upstreamBase).host;
   delete headers['connection'];
 
-  log('info', `收到请求: ${clientReq.method} ${clientReq.url}`, {
-    targetUrl,
-    contentType: clientReq.headers['content-type'] || '',
-  });
-
   try {
     // 收集请求体
     const body = await collectBody(clientReq);
+
+    // 提取模型名（用于按模型统计）
+    const model = extractModel(body);
+
+    log('info', `收到请求: ${clientReq.method} ${clientReq.url}`, {
+      targetUrl,
+      model,
+      contentType: clientReq.headers['content-type'] || '',
+    });
 
     // 判断是否为流式请求
     const isStream = isStreamRequest(clientReq, body);
 
     if (isStream) {
-      await handleStreamRequest(clientReq, clientRes, targetUrl, headers, body);
+      await handleStreamRequest(clientReq, clientRes, targetUrl, headers, body, model);
     } else {
-      await handleNonStreamRequest(clientReq, clientRes, targetUrl, headers, body);
+      await handleNonStreamRequest(clientReq, clientRes, targetUrl, headers, body, model);
     }
 
     const duration = Date.now() - startTime;
     log('info', `请求处理完成`, {
       method: clientReq.method,
       url: clientReq.url,
+      model,
       duration: `${duration}ms`,
     });
 
@@ -526,6 +531,19 @@ async function handleRequest(clientReq, clientRes) {
       }));
     }
   }
+}
+
+/**
+ * 从请求体中提取 model 字段（兼容 OpenAI / Anthropic / Response API 协议）
+ * 只看前 4KB，model 字段通常在请求体开头
+ */
+function extractModel(body) {
+  if (!body || body.length === 0) return '';
+  const preview = body.subarray(0, 4096).toString();
+  // 快速字符串匹配，避免对大请求体做完整 JSON.parse
+  const m = preview.match(/"model"\s*:\s*"([^"]+)"/);
+  if (m) return m[1];
+  return '';
 }
 
 /**

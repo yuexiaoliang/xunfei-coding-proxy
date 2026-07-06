@@ -7,7 +7,7 @@
  * - 响应时长
  * - 实时日志流
  *
- * 不依赖任何第三方包，纯 Node.js 内置模块。
+ * HTTP 层用 express，图表用 Chart.js（CDN），日志解析/统计为业务逻辑。
  *
  * 启动：
  *   node monitor.js
@@ -15,10 +15,9 @@
  *   MONITOR_LOG=/path/to/out.log node monitor.js
  */
 
-const http = require('http');
+const express = require('express');
 const fs = require('fs');
 const path = require('path');
-const { URL } = require('url');
 
 // ============ 配置 ============
 const CONFIG = {
@@ -152,7 +151,8 @@ function computeStats(entries) {
     retried: 0,         // 发生过重试的请求数
     totalRetries: 0,    // 重试总次数（= 收到可重试错误的次数）
     durations: [],      // 响应时长列表
-    byPath: {},         // 按路径统计
+    byPath: {},         // 按路径统计（= 上游接口路径）
+    byModel: {},        // 按模型统计
     byHttpStatus: {},   // 按上游 HTTP 状态码统计
     upstreamErrors: {}, // 按讯飞错误码统计 { code: { count, message, type, lastTs } }
     upstreamErrorList: [], // 错误码列表（前端表格用）
@@ -160,13 +160,36 @@ function computeStats(entries) {
     retryHistogram: {   // 重试次数直方图
       '0': 0, '1-3': 0, '4-10': 0, '11-30': 0, '31+': 0,
     },
+    hourlyBuckets: {},  // { 'YYYY-MM-DD HH:00': { success, failed, retries } }
     windowStart: null,
     windowEnd: null,
   };
 
+  // 滚动小时桶：用相对于"当前整点"的偏移量做 key
+  // 例如当前 09:xx，offset=0 是 09:00-10:00 的桶，offset=-1 是 08:00-09:00
+  function hourOffset(iso) {
+    const t = new Date(iso);
+    if (isNaN(t)) return null;
+    const now = new Date();
+    // 对齐到当前整点
+    const curHour = new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours());
+    const diff = t.getTime() - curHour.getTime();
+    return Math.floor(diff / (3600 * 1000));
+  }
+  function ensureHour(offset) {
+    if (!stats.hourlyBuckets[offset]) stats.hourlyBuckets[offset] = { upstreamSuccess: 0, upstreamFail: 0 };
+    return stats.hourlyBuckets[offset];
+  }
+
   function ensurePath(p) {
     if (!stats.byPath[p]) stats.byPath[p] = { total: 0, success: 0, failed: 0 };
     return stats.byPath[p];
+  }
+
+  function ensureModel(m) {
+    const key = m || '(未知)';
+    if (!stats.byModel[key]) stats.byModel[key] = { total: 0, success: 0, failed: 0, retries: 0, retried: 0, totalRetries: 0, durations: [] };
+    return stats.byModel[key];
   }
 
   function recordUpstreamError(errInfo, ts) {
@@ -195,6 +218,8 @@ function computeStats(entries) {
       stats.total++;
       const urlPath = recvMatch[2].split('?')[0];
       ensurePath(urlPath).total++;
+      const model = e.meta && e.meta.model;
+      ensureModel(model).total++;
       continue;
     }
 
@@ -202,6 +227,8 @@ function computeStats(entries) {
     const okMatch = e.msg.match(/^(流式|非流式)请求成功\s*\(重试\s+(\d+)\s*次/);
     if (okMatch) {
       stats.success++;
+      const hk = hourOffset(e.ts);
+      if (hk) ensureHour(hk).upstreamSuccess++;
       const retries = parseInt(okMatch[2], 10);
       if (retries > 0) stats.retried++;
       // 直方图
@@ -220,6 +247,12 @@ function computeStats(entries) {
         // 尝试匹配已存在的路径，找不到就新建（至少记录成功数）
         ensurePath(p).success++;
       }
+      // 按模型统计
+      const okModel = e.meta && e.meta.model;
+      const mb = ensureModel(okModel);
+      mb.success++;
+      if (retries > 0) mb.retried++;
+      mb.totalRetries += retries;
       continue;
     }
 
@@ -227,6 +260,8 @@ function computeStats(entries) {
     const retryErrMatch = e.msg.match(/(流式请求收到可重试状态码|非流式请求遇到可重试错误|流式请求收到非 SSE 可重试响应|缓冲阶段检测到可重试错误)/);
     if (retryErrMatch) {
       stats.totalRetries++;
+      const hk2 = hourOffset(e.ts);
+      if (hk2) ensureHour(hk2).upstreamFail++;
       // 提取 HTTP 状态码
       const httpCodeMatch = e.msg.match(/状态码:\s*(\d+)/);
       if (httpCodeMatch) {
@@ -237,16 +272,23 @@ function computeStats(entries) {
       const bodyField = e.meta && (e.meta.body || e.meta.bodyPreview || e.meta.eventData);
       const errInfo = extractUpstreamError(bodyField);
       recordUpstreamError(errInfo, e.ts);
+      // 按模型统计重试
+      const retryModel = e.meta && e.meta.model;
+      ensureModel(retryModel).totalRetries++;
       continue;
     }
 
     // 所有重试失败
     if (/所有重试失败/.test(e.msg)) {
       stats.failed++;
+      // 重试耗尽不算上游失败（上游的每次可重试响应已在 upstreamFail 里计过了）
       if (e.meta && e.meta.url) {
         const p = normalizePath(e.meta.url);
         ensurePath(p).failed++;
       }
+      // 按模型统计失败
+      const failModel = e.meta && e.meta.model;
+      ensureModel(failModel).failed++;
       if (stats.errorSamples.length < 30) {
         stats.errorSamples.push({ ts: e.ts, msg: e.msg, meta: e.meta });
       }
@@ -256,7 +298,11 @@ function computeStats(entries) {
     // 请求处理完成 → 拿 duration
     if (/请求处理完成/.test(e.msg) && e.meta && e.meta.duration) {
       const d = parseInt(String(e.meta.duration).replace(/[^\d]/g, ''), 10);
-      if (!isNaN(d) && d >= 500) stats.durations.push(d);  // 过滤 <500ms 的探测请求
+      if (!isNaN(d) && d >= 500) {
+        stats.durations.push(d);  // 过滤 <500ms 的探测请求
+        const doneModel = e.meta && e.meta.model;
+        if (doneModel) ensureModel(doneModel).durations.push(d);
+      }
     }
   }
 
@@ -280,9 +326,48 @@ function computeStats(entries) {
     ? +(stats.totalRetries / stats.success).toFixed(2)
     : 0;
 
+  // 按模型列表（按请求总数排序），计算衍生指标
+  stats.byModelList = Object.entries(stats.byModel).map(([model, d]) => {
+    const done = d.success + d.failed;
+    const sr = done > 0 ? +(d.success / done * 100).toFixed(1) : 0;
+    const avg = d.durations.length > 0
+      ? Math.round(d.durations.reduce((a, b) => a + b, 0) / d.durations.length)
+      : 0;
+    const p50 = d.durations.length > 0
+      ? [...d.durations].sort((a, b) => a - b)[Math.floor(d.durations.length * 0.5)]
+      : 0;
+    const avgRetries = d.success > 0 ? +(d.totalRetries / d.success).toFixed(2) : 0;
+    return { model, total: d.total, success: d.success, failed: d.failed,
+             retries: d.totalRetries, retried: d.retried,
+             successRate: sr, avgDurationMs: avg, p50DurationMs: p50, avgRetries };
+  }).sort((a, b) => b.total - a.total);
+
   // 上游错误列表（按出现次数排序）
   stats.upstreamErrorList = Object.values(stats.upstreamErrors)
     .sort((a, b) => b.count - a.count);
+
+  // 每小时上游成功率列表：按 offset 从小到大（最旧→最新）
+  stats.hourlyList = Object.entries(stats.hourlyBuckets)
+    .map(([offsetStr, d]) => {
+      const offset = parseInt(offsetStr, 10);
+      const now = new Date();
+      const curHour = new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours());
+      const t = new Date(curHour.getTime() + offset * 3600 * 1000);
+      const bj = new Date(t.getTime() + 8 * 3600 * 1000);
+      const label = String(bj.getUTCHours()).padStart(2, '0') + ':00';
+      const dateLabel = bj.getUTCMonth() + 1 + '/' + bj.getUTCDate();
+      // 上游成功率 = 上游成功 / (上游成功 + 上游失败)
+      const upTotal = d.upstreamSuccess + d.upstreamFail;
+      return {
+        offset,
+        label,
+        dateLabel,
+        success: d.upstreamSuccess,
+        fail: d.upstreamFail,
+        rate: upTotal > 0 ? +(d.upstreamSuccess / upTotal * 100).toFixed(1) : 100,
+      };
+    })
+    .sort((a, b) => a.offset - b.offset);
 
   return stats;
 }
@@ -299,42 +384,41 @@ function filterByMinutes(entries, minutes) {
   });
 }
 
-// ============ HTTP 服务 ============
+// ============ HTTP 服务（express） ============
 
-function sendJson(res, code, obj) {
-  res.writeHead(code, {
-    'Content-Type': 'application/json; charset=utf-8',
-    'Cache-Control': 'no-store',
-  });
-  res.end(JSON.stringify(obj));
-}
+const app = express();
 
-function sendHtml(res, html) {
-  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-  res.end(html);
-}
+// CORS（方便本地调试）
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  next();
+});
 
-function handleStats(res, url) {
-  const minutes = parseInt(url.searchParams.get('minutes') || '0', 10);
+// 统计接口
+app.get('/api/stats', (req, res) => {
+  const minutes = parseInt(req.query.minutes || '0', 10);
   const entries = readRecentLogs(5000);
   const filtered = filterByMinutes(entries, minutes);
   const stats = computeStats(filtered);
-  sendJson(res, 200, stats);
-}
+  res.set('Cache-Control', 'no-store');
+  res.json(stats);
+});
 
-function handleLogs(res, url) {
-  const lines = parseInt(url.searchParams.get('lines') || '300', 10);
-  const level = (url.searchParams.get('level') || '').toUpperCase();
-  const q = (url.searchParams.get('q') || '').toLowerCase();
+// 历史日志接口
+app.get('/api/logs', (req, res) => {
+  const lines = parseInt(req.query.lines || '300', 10);
+  const level = (req.query.level || '').toUpperCase();
+  const q = (req.query.q || '').toLowerCase();
   let entries = readRecentLogs(Math.min(lines * 3, 5000));
   if (level) entries = entries.filter(e => e.level === level);
   if (q) entries = entries.filter(e => e.raw.toLowerCase().includes(q));
   entries = entries.slice(-lines);
-  sendJson(res, 200, entries);
-}
+  res.set('Cache-Control', 'no-store');
+  res.json(entries);
+});
 
 // 实时日志 SSE
-function handleSSE(res, req) {
+app.get('/api/stream', (req, res) => {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-store',
@@ -371,558 +455,475 @@ function handleSSE(res, req) {
 
   const timer = setInterval(tick, CONFIG.pollIntervalMs);
   req.on('close', () => clearInterval(timer));
-}
-
-function handleDashboard(res) {
-  sendHtml(res, DASHBOARD_HTML);
-}
-
-// ============ 路由 ============
-const server = http.createServer((req, res) => {
-  const url = new URL(req.url, `http://localhost:${CONFIG.port}`);
-  // CORS（方便本地调试）
-  res.setHeader('Access-Control-Allow-Origin', '*');
-
-  if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html')) {
-    return handleDashboard(res);
-  }
-  if (req.method === 'GET' && url.pathname === '/api/stats') {
-    return handleStats(res, url);
-  }
-  if (req.method === 'GET' && url.pathname === '/api/logs') {
-    return handleLogs(res, url);
-  }
-  if (req.method === 'GET' && url.pathname === '/api/stream') {
-    return handleSSE(res, req);
-  }
-  if (req.method === 'GET' && url.pathname === '/health') {
-    return sendJson(res, 200, {
-      status: 'ok',
-      service: 'xunfei-proxy-monitor',
-      logFile: CONFIG.logFile,
-      logExists: fs.existsSync(CONFIG.logFile),
-    });
-  }
-  sendJson(res, 404, { error: 'Not Found' });
 });
 
-server.listen(CONFIG.port, () => {
+// 仪表盘页面
+app.get(['/', '/index.html'], (req, res) => {
+  res.set('Content-Type', 'text/html; charset=utf-8');
+  res.send(DASHBOARD_HTML);
+});
+
+// 健康检查
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    service: 'xunfei-proxy-monitor',
+    logFile: CONFIG.logFile,
+    logExists: fs.existsSync(CONFIG.logFile),
+  });
+});
+
+// 404
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not Found' });
+});
+
+const server = app.listen(CONFIG.port, () => {
   console.log(`监控仪表盘已启动: http://localhost:${CONFIG.port}`);
   console.log(`日志文件: ${CONFIG.logFile}`);
 });
 
 // ============ 仪表盘 HTML ============
+
+// ============ 仪表盘 HTML（Vue 3 + Element Plus） ============
 const DASHBOARD_HTML = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=5.0">
 <meta name="theme-color" content="#f5f5f5">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="default">
 <title>讯飞代理监控</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/element-plus@2/dist/index.css">
 <style>
   :root {
-    --bg: #f5f5f5; --card: #fff; --border: #d9d9d9;
-    --text: #333; --muted: #999;
-    --accent: #1677ff; --ok: #52c41a; --warn: #faad14; --err: #ff4d4f;
-    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-    --safe-top: env(safe-area-inset-top, 0px);
-    --safe-bottom: env(safe-area-inset-bottom, 0px);
+    --ep-color-primary: #1677ff;
   }
-  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html { -webkit-text-size-adjust: 100%; overflow-x: hidden; }
   body {
-    margin: 0; background: var(--bg); color: var(--text);
+    margin: 0; background: #f5f5f5; color: #333;
     font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
     font-size: 14px; line-height: 1.5;
-    padding-top: var(--safe-top);
-    padding-bottom: var(--safe-bottom);
-    overflow-x: hidden;
+    -webkit-tap-highlight-color: transparent;
   }
-
-  header {
-    position: sticky; top: 0; z-index: 20;
-    padding: 8px 12px;
-    border-bottom: 1px solid var(--border);
-    background: #fff;
-  }
-  .header-row {
-    display: flex; align-items: center; justify-content: space-between; gap: 8px;
-  }
-  header h1 { margin: 0; font-size: 15px; font-weight: 600; white-space: nowrap; }
-  header .meta {
-    color: var(--muted); font-size: 11px; font-family: var(--mono);
-    margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  }
-  .header-right { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
-  select, button, input { font-family: inherit; }
-  select {
-    background: #fff; color: var(--text); border: 1px solid var(--border);
-    padding: 6px 8px; border-radius: 4px; font-size: 13px; cursor: pointer;
-    max-width: 120px;
-  }
-  .btn-icon {
-    background: #fff; color: var(--text); border: 1px solid var(--border);
-    width: 30px; height: 30px; border-radius: 4px; font-size: 15px;
-    display: inline-flex; align-items: center; justify-content: center; cursor: pointer;
-  }
-  .spinner {
-    width: 6px; height: 6px; border-radius: 50%; background: var(--ok);
-    display: inline-block; flex-shrink: 0;
-  }
-
-  main { padding: 12px; max-width: 1200px; margin: 0 auto; }
-
-  .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
-  .card {
-    min-width: 0;
-    background: var(--card); border: 1px solid var(--border); border-radius: 4px;
-    padding: 10px 12px;
-  }
-  .card .label { color: var(--muted); font-size: 12px; margin-bottom: 2px; }
-  .card .value { font-size: 20px; font-weight: 600; font-family: var(--mono); line-height: 1.3; }
-  .card .sub { color: var(--muted); font-size: 11px; margin-top: 2px; word-break: break-word; }
-  .card.ok .value { color: var(--ok); }
-  .card.err .value { color: var(--err); }
-  .card.warn .value { color: var(--warn); }
-  .big-rate { grid-column: span 2; }
-  .big-rate .value { font-size: 28px; }
-
-  section { margin-top: 16px; }
-  section h2 {
-    font-size: 13px; font-weight: 600; margin: 0 0 8px;
-    color: var(--text); display: flex; align-items: center; gap: 8px;
-  }
-  .badge {
-    display: inline-block; padding: 1px 6px; border-radius: 2px;
-    font-size: 11px; font-family: var(--mono); background: #f0f0f0; color: var(--muted);
-  }
-
-  .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
-  table { width: 100%; border-collapse: collapse; }
-  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); font-size: 13px; white-space: nowrap; }
-  th { color: var(--muted); font-weight: 400; font-size: 12px; }
-  td.num { font-family: var(--mono); text-align: right; }
-  td.path { font-family: var(--mono); font-size: 12px; max-width: 180px; overflow: hidden; text-overflow: ellipsis; }
-  .bar { height: 4px; background: #e8e8e8; border-radius: 2px; overflow: hidden; min-width: 40px; }
-  .bar > div { height: 100%; background: var(--accent); border-radius: 2px; }
-
-  .scroll-card { max-height: 240px; overflow-y: auto; -webkit-overflow-scrolling: touch; }
-  #errors { font-family: var(--mono); font-size: 12px; color: var(--err); line-height: 1.5; word-break: break-all; }
-
-  .log-controls { display: flex; flex-direction: column; gap: 8px; margin-bottom: 8px; }
-  .toggle { display: flex; gap: 4px; flex-wrap: wrap; }
-  .toggle button {
-    background: #fff; color: var(--text); border: 1px solid var(--border);
-    padding: 4px 10px; border-radius: 2px; font-size: 12px; cursor: pointer;
-  }
-  .toggle button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
-  .log-controls-bottom { display: flex; gap: 8px; align-items: center; }
-  #search {
-    background: #fff; color: var(--text); border: 1px solid var(--border);
-    padding: 6px 10px; border-radius: 4px; font-size: 13px; flex: 1; min-width: 0;
-  }
-  #search::placeholder { color: var(--muted); }
-  .checkbox-label { color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 4px; white-space: nowrap; }
-
-  #logBox {
-    min-width: 0;
-    background: #fafafa; border: 1px solid var(--border); border-radius: 4px;
+  .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  .kpi-value { font-size: 20px; font-weight: 600; font-family: ui-monospace, Menlo, Consolas, monospace; line-height: 1.3; }
+  .kpi-label { color: #999; font-size: 12px; margin-bottom: 2px; }
+  .kpi-sub { color: #999; font-size: 11px; margin-top: 2px; word-break: break-word; }
+  .ok-color { color: #52c41a; }
+  .err-color { color: #ff4d4f; }
+  .warn-color { color: #faad14; }
+  .big-rate .kpi-value { font-size: 28px; }
+  .log-box {
+    background: #fafafa; border: 1px solid #d9d9d9; border-radius: 4px;
     padding: 8px; height: 55vh; max-height: 500px; min-height: 240px;
     overflow-y: auto; -webkit-overflow-scrolling: touch;
-    font-family: var(--mono); font-size: 12px; line-height: 1.6;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12px; line-height: 1.6;
   }
   .log-line { white-space: pre-wrap; word-break: break-all; padding: 1px 0; }
   .log-line .lv { display: inline-block; min-width: 38px; font-weight: 600; }
-  .lv-INFO { color: var(--accent); }
-  .lv-WARN { color: var(--warn); }
-  .lv-ERROR { color: var(--err); }
-  .lv-DEBUG { color: var(--muted); }
-  .log-line .ts { color: var(--muted); margin-right: 4px; font-size: 11px; }
+  .lv-INFO { color: #1677ff; }
+  .lv-WARN { color: #faad14; }
+  .lv-ERROR { color: #ff4d4f; }
+  .lv-DEBUG { color: #999; }
+  .log-line .ts { color: #999; margin-right: 4px; font-size: 11px; }
   .log-line .meta-inline { color: #bbb; font-size: 11px; }
-
+  .status-chip { display: inline-flex; flex-direction: column; align-items: center; min-width: 64px; padding: 8px 6px; border-radius: 8px; background: #f5f5f5; border: 1px solid #d9d9d9; }
+  .bar { height: 4px; background: #e8e8e8; border-radius: 2px; overflow: hidden; min-width: 40px; }
+  .bar > div { height: 100%; background: #1677ff; border-radius: 2px; }
   @media (min-width: 640px) {
-    main { padding: 16px 20px 40px; }
-    header { padding: 10px 20px; }
-    header h1 { font-size: 16px; }
-    .grid { grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; }
-    .card { padding: 12px 16px; }
-    .card .value { font-size: 24px; }
-    .big-rate .value { font-size: 32px; }
-    .log-controls { flex-direction: row; flex-wrap: wrap; align-items: center; }
-    .log-controls-bottom { flex: 1; }
-    #logBox { font-size: 12px; height: 420px; }
+    .kpi-value { font-size: 24px; }
+    .big-rate .kpi-value { font-size: 32px; }
+    .log-box { font-size: 12px; height: 420px; }
   }
-  @media (min-width: 900px) {
-    .grid { grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); }
-  }
+  [v-cloak] { display: none; }
 </style>
 </head>
 <body>
-<header>
-  <div class="header-row">
-    <div style="min-width:0;flex:1">
-      <h1>讯飞代理监控</h1>
-      <div class="meta" id="winInfo">—</div>
-    </div>
-    <div class="header-right">
-      <select id="windowSel">
-        <option value="0">全部</option>
-        <option value="5">5分钟</option>
-        <option value="15" selected>15分钟</option>
-        <option value="60">1小时</option>
-        <option value="360">6小时</option>
-        <option value="1440">24小时</option>
-      </select>
-      <button class="btn-icon" id="refreshBtn" aria-label="刷新">↻</button>
-      <span class="spinner" title="实时"></span>
-    </div>
-  </div>
-</header>
-
-<main>
-  <div class="grid" id="kpi">
-    <div class="card big-rate ok">
-      <div class="label">成功率</div>
-      <div class="value" id="rate">—</div>
-      <div class="sub" id="rateSub">成功 / 完成</div>
-    </div>
-    <div class="card">
-      <div class="label">请求总数</div>
-      <div class="value" id="total">—</div>
-      <div class="sub" id="totalSub">收到请求数</div>
-    </div>
-    <div class="card ok">
-      <div class="label">成功</div>
-      <div class="value" id="success">—</div>
-      <div class="sub" id="successSub">含重试后成功</div>
-    </div>
-    <div class="card err">
-      <div class="label">失败</div>
-      <div class="value" id="failed">—</div>
-      <div class="sub" id="failedSub">重试耗尽</div>
-    </div>
-    <div class="card warn">
-      <div class="label">重试总次</div>
-      <div class="value" id="retries">—</div>
-      <div class="sub" id="retriesSub">总计 / 平均</div>
-    </div>
-    <div class="card">
-      <div class="label">中位数耗时</div>
-      <div class="value" id="avgDur">—</div>
-      <div class="sub" id="durSub">P50 / P95 / Max</div>
-    </div>
-  </div>
-
-  <section>
-    <h2>按路径分布 <span class="badge" id="pathCount">0</span></h2>
-    <div class="card">
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>路径</th><th class="num">总数</th><th class="num">成功</th><th class="num">失败</th><th class="num">成功率</th></tr></thead>
-          <tbody id="pathTable"></tbody>
-        </table>
+<div id="app" v-cloak>
+  <el-config-provider>
+    <el-header style="position:sticky;top:0;z-index:20;padding:8px 12px;border-bottom:1px solid #d9d9d9;background:#fff;line-height:normal;height:auto">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+        <div style="min-width:0;flex:1">
+          <div style="font-size:15px;font-weight:600;white-space:nowrap">讯飞代理监控</div>
+          <div class="mono" style="color:#999;font-size:11px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ winInfo }}</div>
+        </div>
+        <div style="display:flex;align-items:center;gap:6px;flex-shrink:0">
+          <el-select v-model="minutes" size="small" style="width:110px" @change="fetchStats">
+            <el-option label="全部" :value="0"></el-option>
+            <el-option label="5分钟" :value="5"></el-option>
+            <el-option label="15分钟" :value="15"></el-option>
+            <el-option label="1小时" :value="60"></el-option>
+            <el-option label="6小时" :value="360"></el-option>
+            <el-option label="24小时" :value="1440"></el-option>
+          </el-select>
+          <el-button size="small" circle @click="fetchStats">↻</el-button>
+          <span style="width:6px;height:6px;border-radius:50%;background:#52c41a;display:inline-block;flex-shrink:0"></span>
+        </div>
       </div>
-    </div>
-  </section>
+    </el-header>
 
-  <section>
-    <h2>重试次数分布</h2>
-    <div class="card">
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>重试区间</th><th class="num">请求数</th><th>占比</th></tr></thead>
-          <tbody id="retryTable"></tbody>
-        </table>
-      </div>
-    </div>
-  </section>
+    <main style="padding:12px;max-width:1200px;margin:0 auto">
+      <!-- KPI -->
+      <el-row :gutter="8">
+        <el-col :xs="24" :sm="12" :md="8" class="big-rate">
+          <el-card shadow="never" style="margin-bottom:8px">
+            <div class="kpi-label">成功率</div>
+            <div class="kpi-value ok-color">{{ (stats.successRate * 100).toFixed(1) }}%</div>
+            <div class="kpi-sub">{{ stats.success }} / {{ stats.success + stats.failed }} 完成</div>
+          </el-card>
+        </el-col>
+        <el-col :xs="12" :sm="6" :md="4">
+          <el-card shadow="never" style="margin-bottom:8px">
+            <div class="kpi-label">请求总数</div>
+            <div class="kpi-value">{{ stats.total }}</div>
+            <div class="kpi-sub">{{ unaccounted > 0 ? '收到请求数 · ' + unaccounted + ' 个进行中' : '收到请求数' }}</div>
+          </el-card>
+        </el-col>
+        <el-col :xs="12" :sm="6" :md="4">
+          <el-card shadow="never" style="margin-bottom:8px">
+            <div class="kpi-label">成功</div>
+            <div class="kpi-value ok-color">{{ stats.success }}</div>
+            <div class="kpi-sub">含重试后成功</div>
+          </el-card>
+        </el-col>
+        <el-col :xs="12" :sm="6" :md="4">
+          <el-card shadow="never" style="margin-bottom:8px">
+            <div class="kpi-label">失败</div>
+            <div class="kpi-value err-color">{{ stats.failed }}</div>
+            <div class="kpi-sub">重试耗尽</div>
+          </el-card>
+        </el-col>
+        <el-col :xs="12" :sm="6" :md="4">
+          <el-card shadow="never" style="margin-bottom:8px">
+            <div class="kpi-label">重试总次</div>
+            <div class="kpi-value warn-color">{{ stats.totalRetries }}</div>
+            <div class="kpi-sub">平均 {{ stats.avgRetries }} 次/成功请求</div>
+          </el-card>
+        </el-col>
+        <el-col :xs="24" :sm="12" :md="8">
+          <el-card shadow="never" style="margin-bottom:8px">
+            <div class="kpi-label">中位数耗时</div>
+            <div class="kpi-value">{{ stats.p50DurationMs }}ms</div>
+            <div class="kpi-sub">P95 {{ stats.p95DurationMs }}ms · Max {{ stats.maxDurationMs }}ms · n={{ stats.durations ? stats.durations.length : 0 }}</div>
+          </el-card>
+        </el-col>
+      </el-row>
 
-  <section>
-    <h2>上游状态码</h2>
-      <div class="card" id="statusCard" style="display:flex;flex-wrap:wrap;gap:8px">
-        <span style="color:var(--muted)">—</span>
-      </div>
-    </section>
-    <section>
-      <h2>原平台报错统计 <span class="badge" id="upErrCount">0</span></h2>
-    <div class="card" id="upErrCard" style="padding:0">
-      <div id="upErrTable"></div>
-    </div>
-  </section>
+      <!-- 按模型分布 -->
+      <section style="margin-top:16px">
+        <div style="font-size:13px;font-weight:600;margin-bottom:8px;display:flex;align-items:center;gap:8px">
+          按模型分布 <el-tag size="small" type="info">{{ (stats.byModelList||[]).length }} 种 / {{ modelTotal }} 次</el-tag>
+        </div>
+        <el-card shadow="never">
+          <el-table :data="stats.byModelList || []" size="small" style="width:100%" :scrollable="true">
+            <el-table-column prop="model" label="模型" min-width="120" show-overflow-tooltip></el-table-column>
+            <el-table-column prop="total" label="总数" width="70" align="right"></el-table-column>
+            <el-table-column label="成功" width="60" align="right">
+              <template #default="{ row }"><span class="ok-color">{{ row.success }}</span></template>
+            </el-table-column>
+            <el-table-column label="失败" width="60" align="right">
+              <template #default="{ row }"><span class="err-color">{{ row.failed }}</span></template>
+            </el-table-column>
+            <el-table-column label="重试" width="60" align="right">
+              <template #default="{ row }"><span class="warn-color">{{ row.retries }}</span></template>
+            </el-table-column>
+            <el-table-column label="成功率" width="70" align="right">
+              <template #default="{ row }"><span :style="{color: row.successRate >= 95 ? '#52c41a' : (row.successRate >= 80 ? '#faad14' : '#ff4d4f'), fontWeight: 600}">{{ row.successRate }}%</span></template>
+            </el-table-column>
+            <el-table-column label="P50耗时" width="80" align="right">
+              <template #default="{ row }">{{ row.p50DurationMs || '—' }}ms</template>
+            </el-table-column>
+            <el-table-column prop="avgRetries" label="平均重试" width="70" align="right"></el-table-column>
+          </el-table>
+        </el-card>
+      </section>
 
-  <section>
-    <h2>失败样本</h2>
-    <div class="card scroll-card">
-      <div id="errors">—</div>
-    </div>
-  </section>
+      <!-- 按路径分布 -->
+      <section style="margin-top:16px">
+        <div style="font-size:13px;font-weight:600;margin-bottom:8px;display:flex;align-items:center;gap:8px">
+          按路径分布 <el-tag size="small" type="info">{{ pathList.length }} 条</el-tag>
+        </div>
+        <el-card shadow="never">
+          <el-table :data="pathList" size="small" style="width:100%">
+            <el-table-column label="路径" min-width="180" show-overflow-tooltip>
+              <template #default="{ row }"><span class="mono" style="font-size:12px">{{ row.path }}</span></template>
+            </el-table-column>
+            <el-table-column prop="total" label="总数" width="70" align="right"></el-table-column>
+            <el-table-column label="成功" width="60" align="right">
+              <template #default="{ row }"><span class="ok-color">{{ row.success }}</span></template>
+            </el-table-column>
+            <el-table-column label="失败" width="60" align="right">
+              <template #default="{ row }"><span class="err-color">{{ row.failed }}</span></template>
+            </el-table-column>
+            <el-table-column label="成功率" width="70" align="right">
+              <template #default="{ row }">{{ row.successRate }}</template>
+            </el-table-column>
+          </el-table>
+        </el-card>
+      </section>
 
-  <section>
-    <h2>实时日志 <span class="badge" id="liveBadge">LIVE</span></h2>
-    <div class="log-controls">
-      <div class="toggle" id="levelToggle">
-        <button data-lv="">全部</button>
-        <button data-lv="INFO">INFO</button>
-        <button data-lv="WARN">WARN</button>
-        <button data-lv="ERROR">ERROR</button>
-      </div>
-      <div class="log-controls-bottom">
-        <input id="search" placeholder="搜索关键字…" autocomplete="off">
-        <label class="checkbox-label">
-          <input type="checkbox" id="autoscroll" checked> 置顶新日志
-        </label>
-      </div>
-    </div>
-    <div id="logBox"></div>
-  </section>
-</main>
+      <!-- 重试次数分布 -->
+      <section style="margin-top:16px">
+        <div style="font-size:13px;font-weight:600;margin-bottom:8px">重试次数分布</div>
+        <el-card shadow="never">
+          <el-table :data="retryList" size="small" style="width:100%">
+            <el-table-column prop="range" label="重试区间"></el-table-column>
+            <el-table-column prop="count" label="请求数" width="80" align="right"></el-table-column>
+            <el-table-column label="占比" min-width="120">
+              <template #default="{ row }">
+                <div style="display:flex;align-items:center;gap:6px">
+                  <div class="bar"><div :style="{width: row.pct + '%'}"></div></div>
+                  <span style="color:#999;font-size:11px">{{ row.pct }}%</span>
+                </div>
+              </template>
+            </el-table-column>
+          </el-table>
+        </el-card>
+      </section>
 
+      <!-- 每小时上游成功率 -->
+      <section style="margin-top:16px">
+        <div style="font-size:13px;font-weight:600;margin-bottom:8px">每小时上游接口成功率</div>
+        <el-card shadow="never" style="padding:12px">
+          <div style="position:relative;height:200px">
+            <canvas ref="hourlyChartRef"></canvas>
+          </div>
+        </el-card>
+      </section>
+
+      <!-- 上游状态码 -->
+      <section style="margin-top:16px">
+        <div style="font-size:13px;font-weight:600;margin-bottom:8px">上游状态码</div>
+        <el-card shadow="never">
+          <div v-if="statusList.length" style="display:flex;flex-wrap:wrap;gap:8px">
+            <div v-for="item in statusList" :key="item.code" class="status-chip">
+              <span :style="{color: item.code == 200 ? '#52c41a' : (item.code >= 500 ? '#ff4d4f' : '#faad14'), fontWeight: 700, fontFamily: 'ui-monospace,monospace', fontSize: '16px'}">{{ item.code }}</span>
+              <span class="mono" style="font-size:12px;margin-top:2px">{{ item.count }}</span>
+              <span style="font-size:9px;color:#999">{{ item.pct }}%</span>
+            </div>
+          </div>
+          <span v-else style="color:#999">—</span>
+        </el-card>
+      </section>
+
+      <!-- 原平台报错统计 -->
+      <section style="margin-top:16px">
+        <div style="font-size:13px;font-weight:600;margin-bottom:8px;display:flex;align-items:center;gap:8px">
+          原平台报错统计 <el-tag size="small" type="info">{{ (stats.upstreamErrorList||[]).length }} 种 / {{ upErrTotal }} 次</el-tag>
+        </div>
+        <el-card shadow="never" style="padding:0">
+          <div v-if="(stats.upstreamErrorList||[]).length">
+            <div v-for="(e, i) in (stats.upstreamErrorList||[])" :key="i" style="padding:10px 12px;border-bottom:1px solid #d9d9d9;min-width:0">
+              <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+                <span :style="{color: e.code === '200' ? '#52c41a' : (parseInt(e.code) >= 500 || parseInt(e.code) >= 10000 ? '#ff4d4f' : '#faad14'), fontWeight: 700, fontFamily: 'ui-monospace,monospace', fontSize: '13px'}">{{ e.code }}</span>
+                <span style="color:#999;font-size:10px;background:#f0f0f0;padding:1px 6px;border-radius:999px">{{ e.type || '—' }}</span>
+                <span style="margin-left:auto;font-family:ui-monospace,monospace;font-size:13px;font-weight:600">{{ e.count }} 次</span>
+              </div>
+              <div style="font-size:11px;color:#999;word-break:break-all;line-height:1.4">{{ e.message || '—' }}</div>
+            </div>
+          </div>
+          <div v-else style="padding:16px;color:#999;text-align:center">无报错 🎉</div>
+        </el-card>
+      </section>
+
+      <!-- 失败样本 -->
+      <section style="margin-top:16px">
+        <div style="font-size:13px;font-weight:600;margin-bottom:8px">失败样本</div>
+        <el-card shadow="never" style="max-height:240px;overflow-y:auto">
+          <div v-if="(stats.errorSamples||[]).length" class="mono" style="font-size:12px;color:#ff4d4f;line-height:1.5;word-break:break-all">
+            <div v-for="(e, i) in stats.errorSamples" :key="i" :style="{marginBottom: '6px', paddingBottom: '6px', borderBottom: i < stats.errorSamples.length-1 ? '1px solid #d9d9d9' : 'none'}">
+              [{{ toBJT(e.ts) }}] {{ e.msg }}<br v-if="e.meta && e.meta.url">↳ {{ e.meta && e.meta.url ? e.meta.url : '' }}
+            </div>
+          </div>
+          <span v-else class="ok-color">无失败记录 🎉</span>
+        </el-card>
+      </section>
+
+      <!-- 实时日志 -->
+      <section style="margin-top:16px">
+        <div style="font-size:13px;font-weight:600;margin-bottom:8px;display:flex;align-items:center;gap:8px">
+          实时日志 <el-tag size="small" :type="liveBadgeType">{{ liveBadgeText }}</el-tag>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:8px">
+          <el-radio-group v-model="curLevel" size="small" @change="renderLogs">
+            <el-radio-button label="">全部</el-radio-button>
+            <el-radio-button label="INFO">INFO</el-radio-button>
+            <el-radio-button label="WARN">WARN</el-radio-button>
+            <el-radio-button label="ERROR">ERROR</el-radio-button>
+          </el-radio-group>
+          <div style="display:flex;gap:8px;align-items:center">
+            <el-input v-model="curSearch" placeholder="搜索关键字…" clearable size="small" @input="renderLogs" style="flex:1;min-width:0"></el-input>
+            <el-checkbox v-model="autoscroll" size="small">置顶新日志</el-checkbox>
+          </div>
+        </div>
+        <div ref="logBoxRef" class="log-box">
+          <div v-for="(e, i) in filteredLogs" :key="e.ts + i" class="log-line">
+            <span class="ts">{{ toBJTShort(e.ts) }}</span>
+            <span :class="'lv lv-' + e.level">{{ e.level }}</span> {{ e.msg }}<span v-if="e.meta" class="meta-inline"> {{ JSON.stringify(e.meta).slice(0, 300) }}</span>
+          </div>
+        </div>
+      </section>
+    </main>
+  </el-config-provider>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/vue@3/dist/vue.global.prod.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/element-plus@2"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <script>
-const $ = id => document.getElementById(id);
-let curLevel = '';
-let curSearch = '';
-const MAX_LOG_LINES = 400;
-const logBuf = [];
+const { createApp, ref, reactive, computed, onMounted, nextTick, watch } = Vue;
 
-async function fetchStats() {
-  try {
-    const minutes = $('windowSel').value;
-    const r = await fetch('/api/stats?minutes=' + minutes);
-    const s = await r.json();
-    $('rate').textContent = (s.successRate * 100).toFixed(1) + '%';
-    $('rateSub').textContent = s.success + ' / ' + (s.success + s.failed) + ' 完成';
-    $('total').textContent = s.total;
-    const unaccounted = Math.max(0, s.total - s.success - s.failed);
-    $('totalSub').textContent = unaccounted > 0 ? '收到请求数 · ' + unaccounted + ' 个进行中/未归类' : '收到请求数';
-    $('success').textContent = s.success;
-    $('successSub').textContent = '含重试后成功';
-    $('failed').textContent = s.failed;
-    $('failedSub').textContent = '重试耗尽';
-    $('retries').textContent = s.totalRetries;
-    $('retriesSub').textContent = '平均 ' + s.avgRetries + ' 次/成功请求';
-    $('avgDur').textContent = s.p50DurationMs + 'ms';
-    $('durSub').textContent = 'P95 ' + s.p95DurationMs + 'ms · Max ' + s.maxDurationMs + 'ms · n=' + s.durations.length;
-    $('winInfo').textContent = toBJT(s.windowStart) + ' → ' + toBJT(s.windowEnd);
+const app = createApp({
+  setup() {
+    const stats = reactive({
+      total: 0, success: 0, failed: 0, retried: 0, totalRetries: 0,
+      durations: [], byPath: {}, byHttpStatus: {}, upstreamErrors: {},
+      upstreamErrorList: [], errorSamples: [], retryHistogram: {},
+      hourlyBuckets: {}, windowStart: null, windowEnd: null,
+      successRate: 0, avgDurationMs: 0, p50DurationMs: 0, p95DurationMs: 0, maxDurationMs: 0,
+      avgRetries: 0, byModelList: [], hourlyList: [],
+    });
+    const minutes = ref(1440);
+    const winInfo = ref('—');
+    const logBuf = ref([]);
+    const curLevel = ref('');
+    const curSearch = ref('');
+    const autoscroll = ref(true);
+    const liveBadgeText = ref('LIVE');
+    const liveBadgeType = ref('success');
+    const hourlyChartRef = ref(null);
+    const logBoxRef = ref(null);
+    let chartInstance = null;
+    let es = null;
+    const MAX_LOG_LINES = 400;
 
-    const paths = Object.entries(s.byPath).sort((a,b) => b[1].total - a[1].total);
-    $('pathCount').textContent = paths.length + ' 条';
-    $('pathTable').innerHTML = paths.map(([p, d]) => {
-      const done = d.success + d.failed;
-      const rate = done > 0 ? (d.success / done * 100).toFixed(1) + '%' : '—';
-      return '<tr><td class="path" title="' + esc(p) + '">' + esc(p) + '</td>'
-        + '<td class="num">' + d.total + '</td>'
-        + '<td class="num" style="color:var(--ok)">' + d.success + '</td>'
-        + '<td class="num" style="color:var(--err)">' + d.failed + '</td>'
-        + '<td class="num">' + rate + '</td></tr>';
-    }).join('') || '<tr><td colspan="5" style="color:var(--muted)">—</td></tr>';
+    const unaccounted = computed(() => Math.max(0, stats.total - stats.success - stats.failed));
+    const modelTotal = computed(() => (stats.byModelList || []).reduce((a, b) => a + b.total, 0));
+    const pathList = computed(() => {
+      return Object.entries(stats.byPath || {}).map(([path, d]) => {
+        const done = d.success + d.failed;
+        const rate = done > 0 ? (d.success / done * 100).toFixed(1) + '%' : '—';
+        return { path, total: d.total, success: d.success, failed: d.failed, successRate: rate };
+      }).sort((a, b) => b.total - a.total);
+    });
+    const retryList = computed(() => {
+      const h = stats.retryHistogram || {};
+      const total = Object.values(h).reduce((a, b) => a + b, 0) || 1;
+      return Object.entries(h).map(([range, count]) => ({ range: '重试 ' + range + ' 次', count, pct: (count / total * 100).toFixed(1) }));
+    });
+    const statusList = computed(() => {
+      const entries = Object.entries(stats.byHttpStatus || {}).sort((a, b) => b[1] - a[1]);
+      const total = entries.reduce((a, [, c]) => a + c, 0) || 1;
+      return entries.map(([code, count]) => ({ code, count, pct: (count / total * 100).toFixed(0) }));
+    });
+    const upErrTotal = computed(() => (stats.upstreamErrorList || []).reduce((a, b) => a + b.count, 0));
+    const filteredLogs = computed(() => {
+      let items = logBuf.value;
+      if (curLevel.value) items = items.filter(e => e.level === curLevel.value);
+      if (curSearch.value) items = items.filter(e => e.raw.toLowerCase().includes(curSearch.value.toLowerCase()));
+      return items.slice(-MAX_LOG_LINES).reverse();
+    });
 
-    const totalHist = Object.values(s.retryHistogram).reduce((a,b)=>a+b,0) || 1;
-    $('retryTable').innerHTML = Object.entries(s.retryHistogram).map(([k, v]) => {
-      const pct = (v / totalHist * 100).toFixed(1);
-      return '<tr><td>重试 ' + k + ' 次</td><td class="num">' + v + '</td>'
-        + '<td><div style="display:flex;align-items:center;gap:6px"><div class="bar"><div style="width:' + pct + '%"></div></div><span style="color:var(--muted);font-size:11px">' + pct + '%</span></div></td></tr>';
-    }).join('');
+    function toBJT(iso) {
+      if (!iso) return '—';
+      const t = new Date(iso);
+      if (isNaN(t)) return iso;
+      return t.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+    }
+    function toBJTShort(iso) {
+      if (!iso) return '—';
+      const t = new Date(iso);
+      if (isNaN(t)) return iso;
+      return t.toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+    }
 
-    const codes = Object.entries(s.byHttpStatus).sort((a,b) => b[1]-a[1]);
-    $('statusCard').innerHTML = codes.length ? codes.map(([code, n]) => {
-      const color = code == 200 ? 'var(--ok)' : (code >= 500 ? 'var(--err)' : 'var(--warn)');
-      const total = codes.reduce((a,[,c])=>a+c,0);
-      const pct = (n / total * 100).toFixed(0);
-      return '<div style="display:flex;flex-direction:column;align-items:center;min-width:64px;padding:8px 6px;border-radius:8px;background:#f5f5f5;border:1px solid var(--border)">'
-        + '<span style="color:'+color+';font-weight:700;font-family:var(--mono);font-size:16px">'+esc(code)+'</span>'
-        + '<span style="font-family:var(--mono);font-size:12px;color:var(--text);margin-top:2px">'+n+'</span>'
-        + '<span style="font-size:9px;color:var(--muted)">'+pct+'%</span>'
-        + '</div>';
-    }).join('') : '<span style="color:var(--muted)">—</span>';
+    async function fetchStats() {
+      try {
+        const r = await fetch('/api/stats?minutes=' + minutes.value);
+        const s = await r.json();
+        Object.assign(stats, s);
+        winInfo.value = toBJT(s.windowStart) + ' → ' + toBJT(s.windowEnd);
+        await nextTick();
+        renderChart();
+      } catch (e) { console.error(e); }
+    }
 
-    $('errors').innerHTML = s.errorSamples.length
-      ? s.errorSamples.map(e => '<div>[' + toBJT(e.ts) + '] ' + esc(e.msg) + (e.meta && e.meta.url ? '<br>↳ ' + esc(e.meta.url) : '') + '</div>').join('<hr style="border-color:var(--border);margin:6px 0">')
-      : '<span style="color:var(--ok)">无失败记录 🎉</span>';
+    function renderChart() {
+      const hours = stats.hourlyList || [];
+      const ctx = hourlyChartRef.value;
+      if (!ctx) return;
+      if (chartInstance) chartInstance.destroy();
+      if (hours.length) {
+        chartInstance = new Chart(ctx, {
+          type: 'bar',
+          data: {
+            labels: hours.map(h => h.label),
+            datasets: [{ label: '上游成功率%', data: hours.map(h => h.rate), backgroundColor: hours.map(h => h.rate >= 95 ? '#52c41a' : (h.rate >= 80 ? '#faad14' : '#ff4d4f')), borderRadius: 2 }]
+          },
+          options: {
+            responsive: true, maintainAspectRatio: false,
+            plugins: {
+              legend: { display: false },
+              tooltip: { callbacks: { title: items => hours[items[0].dataIndex].label, label: item => { const h = hours[item.dataIndex]; return '上游成功率: ' + h.rate + '% | 成功: ' + h.success + ' 失败: ' + h.fail; } } }
+            },
+            scales: {
+              y: { beginAtZero: true, max: 100, ticks: { callback: v => v + '%', color: '#999', font: { size: 11 } }, grid: { color: '#eee' } },
+              x: { ticks: { color: '#999', font: { size: 10 }, maxRotation: 0, autoSkip: true, maxTicksLimit: 12 }, grid: { display: false } }
+            }
+          }
+        });
+      }
+    }
 
-    // 原平台报错统计（卡片式，移动端友好）
-    const upErrs = s.upstreamErrorList || [];
-    $('upErrCount').textContent = upErrs.length + ' 种 / ' + upErrs.reduce((a,b)=>a+b.count,0) + ' 次';
-    $('upErrTable').innerHTML = upErrs.length ? upErrs.map(e => {
-      const codeColor = e.code === '200' ? 'var(--ok)' : (parseInt(e.code) >= 500 || parseInt(e.code) >= 10000 ? 'var(--err)' : 'var(--warn)');
-      return '<div style="padding:10px 12px;border-bottom:1px solid var(--border);min-width:0">'
-        + '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">'
-        + '<span style="color:'+codeColor+';font-weight:700;font-family:var(--mono);font-size:13px">'+esc(e.code)+'</span>'
-        + '<span style="color:var(--muted);font-size:10px;background:#f0f0f0;padding:1px 6px;border-radius:999px">'+esc(e.type||'—')+'</span>'
-        + '<span style="margin-left:auto;font-family:var(--mono);font-size:13px;font-weight:600">'+e.count+' 次</span>'
-        + '</div>'
-        + '<div style="font-size:11px;color:var(--muted);word-break:break-all;line-height:1.4">'+esc(e.message||'—')+'</div>'
-        + '</div>';
-    }).join('') : '<div style="padding:16px;color:var(--muted);text-align:center">无报错 🎉</div>';
-  } catch (e) { console.error(e); }
-}
+    function renderLogs() { /* computed 自动响应 */ }
 
-function esc(s) { return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+    async function loadHistory() {
+      try {
+        const r = await fetch('/api/logs?lines=200');
+        const arr = await r.json();
+        logBuf.value = arr;
+      } catch (e) { console.error(e); }
+    }
 
-// ISO UTC 时间 -> 北京时间显示 (YYYY-MM-DD HH:mm:ss)
-function toBJT(iso) {
-  if (!iso) return '—';
-  const t = new Date(iso);
-  if (isNaN(t)) return iso; // 不是合法日期则原样返回
-  // 用 Asia/Shanghai 时区格式化
-  const s = t.toLocaleString('zh-CN', {
-    timeZone: 'Asia/Shanghai',
-    year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', second: '2-digit',
-    hour12: false,
-  });
-  // toLocaleString 在 zh-CN 下格式: 2026/07/05 22:16:18，统一改为 -
-  return s.split("/").join("-");
-}
+    function connectSSE() {
+      try {
+        es = new EventSource('/api/stream');
+        es.onmessage = ev => {
+          try {
+            const e = JSON.parse(ev.data);
+            logBuf.value.push(e);
+            if (logBuf.value.length > MAX_LOG_LINES * 2) logBuf.value.splice(0, logBuf.value.length - MAX_LOG_LINES);
+          } catch {}
+        };
+        es.onopen = () => { liveBadgeText.value = 'LIVE'; liveBadgeType.value = 'success'; };
+        es.onerror = () => { liveBadgeText.value = '断开'; liveBadgeType.value = 'danger'; };
+      } catch (e) { console.error(e); }
+    }
 
-// ISO UTC 时间 -> 北京时间短格式 (HH:mm:ss)
-function toBJTShort(iso) {
-  if (!iso) return '';
-  const t = new Date(iso);
-  if (isNaN(t)) return String(iso).substr(11, 8);
-  return t.toLocaleTimeString('zh-CN', {
-    timeZone: 'Asia/Shanghai',
-    hour: '2-digit', minute: '2-digit', second: '2-digit',
-    hour12: false,
-  });
-}
+    // 下拉刷新(移动端)
+    let touchStartY = 0, pullDistance = 0;
+    function onTouchStart(e) { touchStartY = e.touches[0].clientY; }
+    function onTouchMove(e) { if (window.scrollY === 0 && e.touches[0].clientY > touchStartY) pullDistance = e.touches[0].clientY - touchStartY; }
+    function onTouchEnd() { if (pullDistance > 80) { fetchStats(); loadHistory(); } pullDistance = 0; }
 
-// 批量渲染：用 rAF 合并高频 SSE 日志，避免每条都全量 innerHTML
-let pendingLogs = [];
-let rafScheduled = false;
+    onMounted(() => {
+      loadHistory().then(connectSSE);
+      fetchStats();
+      setInterval(fetchStats, 15000);
+      document.addEventListener('touchstart', onTouchStart, { passive: true });
+      document.addEventListener('touchmove', onTouchMove, { passive: true });
+      document.addEventListener('touchend', onTouchEnd, { passive: true });
+    });
 
-function appendLog(e) {
-  logBuf.push(e);
-  if (logBuf.length > MAX_LOG_LINES) {
-    logBuf.splice(0, logBuf.length - MAX_LOG_LINES);
+    return { stats, minutes, winInfo, logBuf, curLevel, curSearch, autoscroll, liveBadgeText, liveBadgeType,
+             hourlyChartRef, logBoxRef, unaccounted, modelTotal, pathList, retryList, statusList, upErrTotal,
+             filteredLogs, toBJT, toBJTShort, fetchStats, renderLogs };
   }
-  pendingLogs.push(e);
-  scheduleRender();
-}
-
-function scheduleRender() {
-  if (rafScheduled) return;
-  rafScheduled = true;
-  requestAnimationFrame(() => {
-    rafScheduled = false;
-    flushLogs();
-  });
-}
-
-// 倒序显示：最新日志在最上面，无需滚动即可看到
-function flushLogs() {
-  const box = $('logBox');
-  if (!box) return;
-  // 倒序模式：用户在顶部看最新日志。"在顶部"才需要保持滚动到顶
-  const atTop = box.scrollTop <= 30;
-
-  // 如果有过滤条件或积压太多，退化为全量重建
-  if (curLevel || curSearch || pendingLogs.length > 50) {
-    renderLogsFull();
-    pendingLogs = [];
-    if (atTop && $('autoscroll').checked) box.scrollTop = 0;
-    return;
-  }
-
-  // 增量插入到顶部（倒序：pendingLogs 按时间正序，插入时反转）
-  const frag = document.createDocumentFragment();
-  for (let i = pendingLogs.length - 1; i >= 0; i--) {
-    const e = pendingLogs[i];
-    const div = document.createElement('div');
-    div.className = 'log-line';
-    div.innerHTML = '<span class="ts">' + toBJTShort(e.ts) + '</span>'
-      + '<span class="lv lv-' + esc(e.level) + '">' + esc(e.level) + '</span> '
-      + esc(e.msg) + (e.meta ? ' <span class="meta-inline">' + esc(JSON.stringify(e.meta).slice(0, 300)) + '</span>' : '');
-    frag.appendChild(div);
-  }
-  // 插到最前面
-  box.insertBefore(frag, box.firstChild);
-
-  // 超出上限移除尾部旧节点
-  while (box.childNodes.length > MAX_LOG_LINES) {
-    box.removeChild(box.lastChild);
-  }
-
-  pendingLogs = [];
-  // 勾选自动滚动时，新日志进来后保持在顶部
-  if (atTop && $('autoscroll').checked) box.scrollTop = 0;
-}
-
-function renderLogs() {
-  renderLogsFull();
-}
-
-function renderLogsFull() {
-  let items = logBuf;
-  if (curLevel) items = items.filter(e => e.level === curLevel);
-  if (curSearch) items = items.filter(e => e.raw.toLowerCase().includes(curSearch));
-  const box = $('logBox');
-  // 倒序：最新（数组末尾）排在最上面
-  const arr = items.slice(-MAX_LOG_LINES).reverse();
-  box.innerHTML = arr.map(e =>
-    '<div class="log-line"><span class="ts">' + toBJTShort(e.ts) + '</span>'
-    + '<span class="lv lv-' + esc(e.level) + '">' + esc(e.level) + '</span> '
-    + esc(e.msg) + (e.meta ? ' <span class="meta-inline">' + esc(JSON.stringify(e.meta).slice(0, 300)) + '</span>' : '')
-    + '</div>'
-  ).join('');
-}
-
-async function loadHistory() {
-  try {
-    const r = await fetch('/api/logs?lines=200');
-    const arr = await r.json();
-    logBuf.length = 0;
-    // 批量插入，只触发一次渲染
-    for (const e of arr) logBuf.push(e);
-    if (logBuf.length > MAX_LOG_LINES) logBuf.splice(0, logBuf.length - MAX_LOG_LINES);
-    pendingLogs = [...logBuf];
-    // 首次加载走全量重建（确保过滤生效）
-    renderLogsFull();
-    pendingLogs = [];
-  } catch (e) { console.error(e); }
-}
-
-function connectSSE() {
-  try {
-    const es = new EventSource('/api/stream');
-    es.onmessage = ev => {
-      try { appendLog(JSON.parse(ev.data)); } catch {}
-    };
-    es.onopen = () => { $('liveBadge').textContent = 'LIVE'; $('liveBadge').style.background = '#22c55e'; };
-    es.onerror = () => { $('liveBadge').textContent = '断开'; $('liveBadge').style.background = 'var(--err)'; };
-  } catch (e) { console.error(e); }
-}
-
-// 事件绑定(用 touch 友好的 click)
-$('windowSel').addEventListener('change', fetchStats);
-$('refreshBtn').addEventListener('click', fetchStats);
-$('levelToggle').addEventListener('click', e => {
-  const b = e.target.closest('button'); if (!b) return;
-  curLevel = b.dataset.lv;
-  $('levelToggle').querySelectorAll('button').forEach(x => x.classList.toggle('active', x === b));
-  renderLogs();
 });
-$('search').addEventListener('input', e => { curSearch = e.target.value.toLowerCase(); renderLogs(); });
-document.querySelector('#levelToggle button[data-lv=""]').classList.add('active');
 
-// 下拉刷新手势(移动端):页面顶部下拉时刷新
-let touchStartY = 0, pullDistance = 0;
-document.addEventListener('touchstart', e => { touchStartY = e.touches[0].clientY; }, { passive: true });
-document.addEventListener('touchmove', e => {
-  if (window.scrollY === 0 && e.touches[0].clientY > touchStartY) {
-    pullDistance = e.touches[0].clientY - touchStartY;
-  }
-}, { passive: true });
-document.addEventListener('touchend', () => {
-  if (pullDistance > 80) { fetchStats(); loadHistory(); }
-  pullDistance = 0;
-}, { passive: true });
-
-// 初始化
-loadHistory().then(connectSSE);
-fetchStats();
-setInterval(fetchStats, 15000);
+app.use(ElementPlus);
+app.mount('#app');
 </script>
 </body>
 </html>`;
