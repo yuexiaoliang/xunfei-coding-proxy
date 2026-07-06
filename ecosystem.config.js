@@ -34,11 +34,11 @@ module.exports = {
         // 讯飞 API 基础地址
         UPSTREAM_BASE: 'https://maas-coding-api.cn-huabei-1.xf-yun.com',
         // 最大重试次数
-        MAX_RETRIES: 60,
-        // 重试间隔（固定，每3秒一次）
-        RETRY_DELAY_MS: 3000,
-        // 请求超时（毫秒，5分钟）
-        REQUEST_TIMEOUT_MS: 300000,
+        MAX_RETRIES: 1800,
+        // 重试间隔（固定，每200毫秒一次）
+        RETRY_DELAY_MS: 200,
+        // 请求超时（毫秒，6分钟）
+        REQUEST_TIMEOUT_MS: 360000,
         // 日志级别: debug | info | warn | error
         LOG_LEVEL: 'info',
       },

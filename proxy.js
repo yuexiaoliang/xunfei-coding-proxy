@@ -41,9 +41,9 @@ const CONFIG = {
   upstreamBase: process.env.UPSTREAM_BASE || 'https://maas-coding-api.cn-huabei-1.xf-yun.com',
 
   // 重试配置
-  maxRetries: parseInt(process.env.MAX_RETRIES || '60', 10),
-  // 重试间隔（固定，每3秒一次）
-  retryDelayMs: parseInt(process.env.RETRY_DELAY_MS || '3000', 10),
+  maxRetries: parseInt(process.env.MAX_RETRIES || '1800', 10),
+  // 重试间隔（固定，每200毫秒一次）
+  retryDelayMs: parseInt(process.env.RETRY_DELAY_MS || '200', 10),
 
   // 需要重试的 HTTP 状态码
   retryStatusCodes: new Set([
@@ -62,7 +62,7 @@ const CONFIG = {
   ]),
 
   // 请求超时（毫秒）
-  requestTimeoutMs: parseInt(process.env.REQUEST_TIMEOUT_MS || '300000', 10),
+  requestTimeoutMs: parseInt(process.env.REQUEST_TIMEOUT_MS || '360000', 10),
 
   // 日志级别: 'debug' | 'info' | 'warn' | 'error'
   logLevel: process.env.LOG_LEVEL || 'info',
@@ -86,7 +86,7 @@ function sleep(ms) {
 
 function calculateDelay() {
   // 固定间隔（加少量抖动避免惊群）
-  return CONFIG.retryDelayMs + Math.floor(Math.random() * 200);
+  return CONFIG.retryDelayMs + Math.floor(Math.random() * 50);
 }
 
 /**

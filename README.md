@@ -89,9 +89,9 @@ npm run pm2:start   # ecosystem.config.js 已包含 monitor
 |------|--------|------|
 | `PROXY_PORT` | `9090` | 代理监听端口 |
 | `UPSTREAM_BASE` | `https://maas-coding-api.cn-huabei-1.xf-yun.com` | 讯飞 API 基础地址 |
-| `MAX_RETRIES` | `60` | 最大重试次数 |
-| `RETRY_DELAY_MS` | `1000` | 重试间隔（固定，毫秒） |
-| `REQUEST_TIMEOUT_MS` | `300000` | 请求超时（毫秒） |
+| `MAX_RETRIES` | `1800` | 最大重试次数 |
+| `RETRY_DELAY_MS` | `200` | 重试间隔（固定，毫秒） |
+| `REQUEST_TIMEOUT_MS` | `360000` | 请求超时（毫秒） |
 | `LOG_LEVEL` | `info` | 日志级别 |
 
 ## PM2 常用命令
@@ -106,8 +106,8 @@ npm run pm2:status     # 查看状态
 
 ## 重试策略
 
-- 固定每秒重试一次，最多重试 60 次（约 1 分钟）
-- 添加少量随机抖动（0~200ms），避免多个请求同时重试
+- 固定每 200ms 重试一次，最多重试 1800 次（约 6 分钟）
+- 添加少量随机抖动（0~50ms），避免多个请求同时重试
 - 对流式响应，先缓冲前几个 SSE 事件检查错误码，确认无错误后再直通转发
 - 可重试的讯飞错误码：10010、10012、10110
 
